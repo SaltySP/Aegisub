@@ -96,18 +96,6 @@ class AudioDisplay: public wxWindow {
 	/// Timer for scrolling when markers are dragged out of the displayed area
 	wxTimer scroll_timer;
 
-	/// Timer used to throttle repaints triggered by marker movement to
-	/// roughly the display refresh rate, so that a fast marker drag can't
-	/// queue up repaints (and everything downstream of them) faster than
-	/// they can actually be shown.
-	wxTimer marker_paint_timer;
-	/// Whether a marker moved while marker_paint_timer was already running,
-	/// meaning a repaint is still owed once it fires.
-	bool marker_repaint_pending = false;
-	/// Fires periodically while marker_paint_timer is running to flush any
-	/// pending marker repaint at a bounded rate.
-	void OnMarkerPaintTimer(wxTimerEvent &event);
-
 	wxTimer load_timer;
 	int64_t last_sample_decoded = 0;
 	/// Time at which audio loading began, for calculating loading speed

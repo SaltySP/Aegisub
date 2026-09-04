@@ -606,7 +606,6 @@ AudioDisplay::AudioDisplay(wxWindow *parent, AudioController *controller, agi::C
 	Bind(wxEVT_CHAR_HOOK, &AudioDisplay::OnKeyDown, this);
 	Bind(wxEVT_KEY_DOWN, &AudioDisplay::OnKeyDown, this);
 	scroll_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnScrollTimer, this);
-	marker_paint_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnMarkerPaintTimer, this);
 	load_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnLoadTimer, this);
 }
 
@@ -1382,36 +1381,5 @@ void AudioDisplay::OnStyleRangesChanged()
 
 void AudioDisplay::OnMarkerMoved()
 {
-	// A marker drag can generate mouse-move events (and thus calls to this
-	// function) much faster than the display can actually present frames,
-	// particularly on Windows where they aren't coalesced upstream. Without
-	// throttling, each one triggers an immediate repaint, which can queue up
-	// faster than they can be drawn and make the whole UI appear to freeze.
-	//
-	// To bound this, the first marker move in a burst repaints immediately
-	// (so single clicks/slow drags stay perfectly responsive) and then starts
-	// a short cooldown; any further moves during the cooldown just note that
-	// a repaint is still owed instead of repainting again right away. When
-	// the cooldown timer fires, any owed repaint is flushed and, if the
-	// marker is still moving, a new cooldown begins - capping the repaint
-	// rate to roughly 60Hz regardless of how fast the input events arrive.
-	if (!marker_paint_timer.IsRunning())
-	{
-		RefreshRect(wxRect(0, audio_top, GetClientSize().GetWidth(), audio_height), false);
-		marker_repaint_pending = false;
-		marker_paint_timer.StartOnce(16);
-	}
-	else
-	{
-		marker_repaint_pending = true;
-	}
-}
-
-void AudioDisplay::OnMarkerPaintTimer(wxTimerEvent &)
-{
-	if (!marker_repaint_pending) return;
-
-	marker_repaint_pending = false;
 	RefreshRect(wxRect(0, audio_top, GetClientSize().GetWidth(), audio_height), false);
-	marker_paint_timer.StartOnce(16);
 }

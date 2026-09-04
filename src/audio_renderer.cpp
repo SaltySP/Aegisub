@@ -56,12 +56,21 @@ AudioRendererBitmapCacheBitmapFactory::AudioRendererBitmapCacheBitmapFactory(Aud
 
 std::unique_ptr<wxBitmap> AudioRendererBitmapCacheBitmapFactory::ProduceBlock(int /* i */)
 {
-	return std::make_unique<wxBitmap>(renderer->cache_bitmap_width, renderer->pixel_height, 24);
+	// Use the screen's native depth (typically 32bpp on modern Windows)
+	// rather than hardcoding 24bpp. A depth that doesn't match the
+	// destination DC forces GDI to fall back to a slow DIB conversion
+	// (StretchDIBits) on every blit instead of a fast BitBlt, even when
+	// no actual scaling is happening.
+	return std::make_unique<wxBitmap>(renderer->cache_bitmap_width, renderer->pixel_height, wxBITMAP_SCREEN_DEPTH);
 }
 
 size_t AudioRendererBitmapCacheBitmapFactory::GetBlockSize() const
 {
-	return sizeof(wxBitmap) + renderer->cache_bitmap_width * renderer->pixel_height * 3;
+	// Depth now matches the screen (wxBITMAP_SCREEN_DEPTH) rather than being
+	// a hardcoded 24bpp, so conservatively assume 4 bytes/pixel (32bpp) for
+	// cache accounting purposes; this only affects when the cache decides
+	// it's full, not correctness.
+	return sizeof(wxBitmap) + renderer->cache_bitmap_width * renderer->pixel_height * 4;
 }
 
 AudioRenderer::AudioRenderer()
