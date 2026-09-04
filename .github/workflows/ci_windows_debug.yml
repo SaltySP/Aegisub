@@ -1,4 +1,4 @@
-name: Meson CI Windows
+name: Meson CI Windows Debug
 
 on:
   workflow_dispatch:
