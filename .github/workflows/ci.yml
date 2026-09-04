@@ -1,11 +1,6 @@
 name: Meson CI
 
 on:
-  push:
-    branches: [ 'migration*' ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
 
 jobs:
