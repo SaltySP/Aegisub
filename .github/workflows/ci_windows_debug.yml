@@ -1,0 +1,132 @@
+name: Meson CI Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: Windows MSVC Debug
+            os: windows-latest
+            msvc: true
+            devenv: |
+              Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+              Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+            # debugoptimized keeps roughly the same optimization level as
+            # release but tells MSVC to emit /Zi and produce matching .pdb
+            # files, so profilers (VerySleepy, WPA, etc.) can resolve real
+            # Aegisub function names instead of guessing nearest exports.
+            buildtype: debugoptimized
+            args: >-
+              -Ddefault_library=static
+              --force-fallback-for=zlib,harfbuzz,freetype2,fribidi,libpng
+              -Dfallback_nasm=true
+              -Dfreetype2:harfbuzz=disabled
+              -Dharfbuzz:freetype=disabled
+              -Dharfbuzz:cairo=disabled
+              -Dharfbuzz:glib=disabled
+              -Dharfbuzz:gobject=disabled
+              -Dharfbuzz:tests=disabled
+              -Dharfbuzz:docs=disabled
+              -Dfribidi:tests=false
+              -Dfribidi:docs=false
+              -Dlibass:fontconfig=disabled
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: '0'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Setup Meson
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install meson
+
+      - name: Find Visual Studio
+        if: matrix.config.msvc
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Could not find a Visual Studio installation" }
+          "VS=$vsPath" >> $env:GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          choco install ninja innosetup
+
+          $moonscripturl = "https://github.com/leafo/moonscript/releases/download/v0.6.0/moonscript-v0.6.0-windows-x86_64.zip"
+          mkdir moonscript
+          Invoke-WebRequest -Uri $moonscripturl -OutFile ".\moonscript\moonscript.zip"
+          pushd moonscript
+          7z e moonscript.zip
+          Get-Location | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          popd
+
+          $gettexturl = "https://github.com/mlocati/gettext-iconv-windows/releases/download/v1.0-v1.18-r3/gettext1.0-iconv1.18-static-64.zip"
+          Invoke-WebRequest -Uri $gettexturl -OutFile ".\gettext.zip"
+          Expand-Archive ".\gettext.zip" -DestinationPath gettext
+          pushd gettext/bin
+          Get-Location | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          popd
+
+      - name: Configure
+        run: |
+          ${{ matrix.config.devenv }}
+          meson setup build ${{ matrix.config.args }} -Dbuildtype=${{ matrix.config.buildtype }} ${{ github.ref_type == 'tag' && '-Dofficial_release=true' || '' }}
+
+      - name: Build
+        run: |
+          ${{ matrix.config.devenv }}
+          meson compile -C build
+
+      - name: Run test
+        run: |
+          ${{ matrix.config.devenv }}
+          meson test -C build --verbose "gtest main"
+
+      - name: Generate Windows installer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ${{ matrix.config.devenv }}
+          meson compile win-installer -C build
+
+      - name: Generate Windows portable installer
+        run: |
+          ${{ matrix.config.devenv }}
+          cd build && ninja win-portable
+
+      - name: Upload artifacts - win_installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.config.name }} - installer
+          path: build/Aegisub-*.exe
+          if-no-files-found: error
+
+      - name: Upload artifacts - portable.zip
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.config.name }} - portable
+          path: build/aegisub-portable-64.zip
+          if-no-files-found: error
+
+      # The installer/portable zip generally won't bundle .pdb files, and
+      # VerySleepy/WPA need them sitting next to the matching .exe/.dll to
+      # resolve real function names. Upload them separately so they can be
+      # downloaded and dropped alongside the built binaries.
+      - name: Upload artifacts - debug symbols (pdb)
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.config.name }} - pdb
+          path: build/**/*.pdb
+          if-no-files-found: warn
