@@ -135,7 +135,7 @@ void BaseGrid::OnDPIChanged(wxDPIChangedEvent &e) {
 	e.Skip();
 }
 
-void BaseGrid::OnSubtitlesCommit(int type) {
+void BaseGrid::OnSubtitlesCommit(int type, const AssDialogue *changed) {
 	if (type == AssFile::COMMIT_NEW || type & AssFile::COMMIT_ORDER || type & AssFile::COMMIT_DIAG_ADDREM || type & AssFile::COMMIT_FOLD)
 		UpdateMaps();
 
@@ -144,8 +144,26 @@ void BaseGrid::OnSubtitlesCommit(int type) {
 		Refresh(false);
 		return;
 	}
-	if (type & AssFile::COMMIT_DIAG_TIME)
-		Refresh(false);
+	if (type & AssFile::COMMIT_DIAG_TIME) {
+		// A timing commit only ever changes the start/end time of a single
+		// line (e.g. dragging an audio marker with auto-commit on, which can
+		// fire once per mouse-move event). A full-window Refresh() here means
+		// every one of those redraws the entire visible grid - potentially
+		// hundreds of rows - which dominates the UI thread during a fast
+		// drag. When we know which single line changed, refresh just that
+		// row instead; only fall back to a full refresh for multi-line
+		// changes (changed == nullptr) where more than one row's timing
+		// display might need updating.
+		if (changed) {
+			int row = changed->Fold.getVisibleRow();
+			if (row >= yPos && row < yPos + GetClientSize().GetHeight() / lineHeight + 1) {
+				int w = GetClientSize().GetWidth();
+				RefreshRect(wxRect(0, (row - yPos + 1) * lineHeight, w, lineHeight + 1), false);
+			}
+		}
+		else
+			Refresh(false);
+	}
 	else if (type & AssFile::COMMIT_DIAG_TEXT) {
 		for (auto const& rect : text_refresh_rects)
 			RefreshRect(rect, false);

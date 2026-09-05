@@ -606,7 +606,6 @@ AudioDisplay::AudioDisplay(wxWindow *parent, AudioController *controller, agi::C
 	Bind(wxEVT_CHAR_HOOK, &AudioDisplay::OnKeyDown, this);
 	Bind(wxEVT_KEY_DOWN, &AudioDisplay::OnKeyDown, this);
 	scroll_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnScrollTimer, this);
-	marker_paint_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnMarkerPaintTimer, this);
 	load_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnLoadTimer, this);
 }
 
@@ -1380,73 +1379,7 @@ void AudioDisplay::OnStyleRangesChanged()
 	RefreshRect(wxRect(0, audio_top, GetClientSize().GetWidth(), audio_height), false);
 }
 
-wxRect AudioDisplay::GetMarkerRepaintRect()
-{
-	// A full-window-width repaint has to be flushed through wxWidgets'
-	// double-buffering machinery, which on MSW forces a DIB-backed blit
-	// (wxMSWDCImpl::DoStretchBlit taking the StretchDIBits path) regardless
-	// of whether anything is actually being scaled - see
-	// wxSharedDCBufferManager::DoCreateBuffer in wx's src/common/dcbufcmn.cpp,
-	// which explicitly uses a 24bpp (and therefore DIB-backed, per
-	// wxShouldCreateDIB) buffer bitmap on MSW. That cost scales with the
-	// number of pixels copied, so keeping the invalidated rect tight to the
-	// marker itself (instead of the full display width) directly reduces it.
-	//
-	// The marker's own position isn't passed to this signal, so the mouse
-	// position is used as a close approximation while dragging (snapping can
-	// offset it slightly, hence the generous padding). The rect is unioned
-	// with wherever the marker was last painted so its previous position
-	// gets properly erased too.
-	const int margin = 60;
-	wxRect rect(0, audio_top, GetClientSize().GetWidth(), audio_height);
-
-	wxPoint mouse = ScreenToClient(wxGetMousePosition());
-	if (mouse.x >= -margin && mouse.x <= GetClientSize().GetWidth() + margin)
-	{
-		int x0 = std::max(0, mouse.x - margin);
-		int x1 = std::min(GetClientSize().GetWidth(), mouse.x + margin);
-		rect = wxRect(x0, audio_top, x1 - x0, audio_height);
-
-		if (marker_dirty_rect.GetWidth() > 0)
-			rect = rect.Union(marker_dirty_rect);
-	}
-
-	marker_dirty_rect = rect;
-	return rect;
-}
-
 void AudioDisplay::OnMarkerMoved()
 {
-	// A marker drag can generate mouse-move events (and thus calls to this
-	// function) much faster than the display can actually present frames,
-	// particularly on Windows where they aren't coalesced upstream. Without
-	// throttling, each one triggers an immediate repaint, which can queue up
-	// faster than they can be drawn and make the whole UI appear to freeze.
-	//
-	// To bound this, the first marker move in a burst repaints immediately
-	// (so single clicks/slow drags stay perfectly responsive) and then starts
-	// a short cooldown; any further moves during the cooldown just note that
-	// a repaint is still owed instead of repainting again right away. When
-	// the cooldown timer fires, any owed repaint is flushed and, if the
-	// marker is still moving, a new cooldown begins - capping the repaint
-	// rate to roughly 60Hz regardless of how fast the input events arrive.
-	if (!marker_paint_timer.IsRunning())
-	{
-		RefreshRect(GetMarkerRepaintRect(), false);
-		marker_repaint_pending = false;
-		marker_paint_timer.StartOnce(16);
-	}
-	else
-	{
-		marker_repaint_pending = true;
-	}
-}
-
-void AudioDisplay::OnMarkerPaintTimer(wxTimerEvent &)
-{
-	if (!marker_repaint_pending) return;
-
-	marker_repaint_pending = false;
-	RefreshRect(GetMarkerRepaintRect(), false);
-	marker_paint_timer.StartOnce(16);
+	RefreshRect(wxRect(0, audio_top, GetClientSize().GetWidth(), audio_height), false);
 }
