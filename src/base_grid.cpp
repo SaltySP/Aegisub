@@ -79,6 +79,8 @@ BaseGrid::BaseGrid(wxWindow* parent, agi::Context *context)
 
 	SetBackgroundStyle(wxBG_STYLE_PAINT);
 
+	timing_commit_paint_timer.Bind(wxEVT_TIMER, &BaseGrid::OnTimingCommitPaintTimer, this);
+
 	for (size_t i : agi::util::range(std::min(columns_visible.size(), columns.size()))) {
 		if (!columns_visible[i])
 			columns[i]->SetVisible(false);
@@ -147,27 +149,68 @@ void BaseGrid::OnSubtitlesCommit(int type, const AssDialogue *changed) {
 	if (type & AssFile::COMMIT_DIAG_TIME) {
 		// A timing commit only ever changes the start/end time of a single
 		// line (e.g. dragging an audio marker with auto-commit on, which can
-		// fire once per mouse-move event). A full-window Refresh() here means
-		// every one of those redraws the entire visible grid - potentially
-		// hundreds of rows - which dominates the UI thread during a fast
-		// drag. When we know which single line changed, refresh just that
-		// row instead; only fall back to a full refresh for multi-line
-		// changes (changed == nullptr) where more than one row's timing
-		// display might need updating.
+		// fire once per mouse-move event). BaseGrid::OnPaint has no
+		// row-level clipping - it redraws every visible row on any repaint
+		// regardless of how small the invalidated rect is - so what actually
+		// matters here is how often a repaint gets requested at all, not how
+		// large the requested rect is. RequestTimingCommitRepaint coalesces
+		// these to roughly 60Hz so a fast drag can't queue up dozens of full
+		// grid redraws per second.
 		if (changed) {
 			int row = changed->Fold.getVisibleRow();
 			if (row >= yPos && row < yPos + GetClientSize().GetHeight() / lineHeight + 1) {
 				int w = GetClientSize().GetWidth();
-				RefreshRect(wxRect(0, (row - yPos + 1) * lineHeight, w, lineHeight + 1), false);
+				wxRect rect(0, (row - yPos + 1) * lineHeight, w, lineHeight + 1);
+				RequestTimingCommitRepaint(&rect);
 			}
 		}
 		else
-			Refresh(false);
+			RequestTimingCommitRepaint(nullptr);
 	}
 	else if (type & AssFile::COMMIT_DIAG_TEXT) {
 		for (auto const& rect : text_refresh_rects)
 			RefreshRect(rect, false);
 	}
+}
+
+void BaseGrid::RequestTimingCommitRepaint(const wxRect *rect) {
+	if (!timing_commit_paint_timer.IsRunning()) {
+		if (rect)
+			RefreshRect(*rect, false);
+		else
+			Refresh(false);
+		timing_commit_paint_pending = false;
+		timing_commit_paint_pending_full = false;
+		timing_commit_paint_timer.StartOnce(16);
+		return;
+	}
+
+	timing_commit_paint_pending = true;
+	if (timing_commit_paint_pending_full || !rect) {
+		timing_commit_paint_pending_full = true;
+		return;
+	}
+	if (timing_commit_pending_rect.GetWidth() == 0)
+		timing_commit_pending_rect = *rect;
+	else if (timing_commit_pending_rect != *rect)
+		// Two different rows were touched within one cooldown window; fall
+		// back to a full refresh rather than tracking multiple rects.
+		timing_commit_paint_pending_full = true;
+}
+
+void BaseGrid::OnTimingCommitPaintTimer(wxTimerEvent &) {
+	if (!timing_commit_paint_pending) return;
+
+	timing_commit_paint_pending = false;
+	if (timing_commit_paint_pending_full) {
+		timing_commit_paint_pending_full = false;
+		Refresh(false);
+	}
+	else {
+		RefreshRect(timing_commit_pending_rect, false);
+	}
+	timing_commit_pending_rect = wxRect();
+	timing_commit_paint_timer.StartOnce(16);
 }
 
 void BaseGrid::OnShowColMenu(wxCommandEvent &event) {

@@ -34,6 +34,7 @@
 #include <vector>
 #include <wx/brush.h>
 #include <wx/scrolbar.h>
+#include <wx/timer.h>
 #include <wx/window.h>
 
 namespace agi {
@@ -110,6 +111,24 @@ class BaseGrid final : public wxWindow {
 	void OnSubtitlesCommit(int type, const AssDialogue *changed);
 	void OnActiveLineChanged(AssDialogue *);
 	void OnSeek();
+
+	/// BaseGrid::OnPaint has no row-level clipping - every call redraws
+	/// every visible row regardless of how small the invalidated rect is.
+	/// A timing commit (e.g. dragging an audio marker with auto-commit on)
+	/// can fire many times a second, so rather than requesting a repaint on
+	/// every single one, those requests are coalesced to roughly 60Hz here.
+	wxTimer timing_commit_paint_timer;
+	/// Rect still owed to be repainted once the timer fires; empty (width 0)
+	/// means nothing pending. Ignored if timing_commit_paint_pending_full.
+	wxRect timing_commit_pending_rect;
+	/// Set when a pending repaint needs the whole grid (e.g. a multi-line
+	/// timing change, or two different rows touched within one cooldown
+	/// window) rather than a single row's rect.
+	bool timing_commit_paint_pending_full = false;
+	/// Whether a repaint is owed at all once the timer fires.
+	bool timing_commit_paint_pending = false;
+	void RequestTimingCommitRepaint(const wxRect *rect);
+	void OnTimingCommitPaintTimer(wxTimerEvent &event);
 
 	void AdjustScrollbar();
 	void SetColumnWidths();
