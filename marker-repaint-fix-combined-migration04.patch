@@ -1,0 +1,120 @@
+diff --git a/src/audio_display.cpp b/src/audio_display.cpp
+index b2e181e..77a425c 100644
+--- a/src/audio_display.cpp
++++ b/src/audio_display.cpp
+@@ -606,6 +606,7 @@ AudioDisplay::AudioDisplay(wxWindow *parent, AudioController *controller, agi::C
+ 	Bind(wxEVT_CHAR_HOOK, &AudioDisplay::OnKeyDown, this);
+ 	Bind(wxEVT_KEY_DOWN, &AudioDisplay::OnKeyDown, this);
+ 	scroll_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnScrollTimer, this);
++	marker_paint_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnMarkerPaintTimer, this);
+ 	load_timer.Bind(wxEVT_TIMER, &AudioDisplay::OnLoadTimer, this);
+ }
+ 
+@@ -1379,7 +1380,73 @@ void AudioDisplay::OnStyleRangesChanged()
+ 	RefreshRect(wxRect(0, audio_top, GetClientSize().GetWidth(), audio_height), false);
+ }
+ 
++wxRect AudioDisplay::GetMarkerRepaintRect()
++{
++	// A full-window-width repaint has to be flushed through wxWidgets'
++	// double-buffering machinery, which on MSW forces a DIB-backed blit
++	// (wxMSWDCImpl::DoStretchBlit taking the StretchDIBits path) regardless
++	// of whether anything is actually being scaled - see
++	// wxSharedDCBufferManager::DoCreateBuffer in wx's src/common/dcbufcmn.cpp,
++	// which explicitly uses a 24bpp (and therefore DIB-backed, per
++	// wxShouldCreateDIB) buffer bitmap on MSW. That cost scales with the
++	// number of pixels copied, so keeping the invalidated rect tight to the
++	// marker itself (instead of the full display width) directly reduces it.
++	//
++	// The marker's own position isn't passed to this signal, so the mouse
++	// position is used as a close approximation while dragging (snapping can
++	// offset it slightly, hence the generous padding). The rect is unioned
++	// with wherever the marker was last painted so its previous position
++	// gets properly erased too.
++	const int margin = 60;
++	wxRect rect(0, audio_top, GetClientSize().GetWidth(), audio_height);
++
++	wxPoint mouse = ScreenToClient(wxGetMousePosition());
++	if (mouse.x >= -margin && mouse.x <= GetClientSize().GetWidth() + margin)
++	{
++		int x0 = std::max(0, mouse.x - margin);
++		int x1 = std::min(GetClientSize().GetWidth(), mouse.x + margin);
++		rect = wxRect(x0, audio_top, x1 - x0, audio_height);
++
++		if (marker_dirty_rect.GetWidth() > 0)
++			rect = rect.Union(marker_dirty_rect);
++	}
++
++	marker_dirty_rect = rect;
++	return rect;
++}
++
+ void AudioDisplay::OnMarkerMoved()
+ {
+-	RefreshRect(wxRect(0, audio_top, GetClientSize().GetWidth(), audio_height), false);
++	// A marker drag can generate mouse-move events (and thus calls to this
++	// function) much faster than the display can actually present frames,
++	// particularly on Windows where they aren't coalesced upstream. Without
++	// throttling, each one triggers an immediate repaint, which can queue up
++	// faster than they can be drawn and make the whole UI appear to freeze.
++	//
++	// To bound this, the first marker move in a burst repaints immediately
++	// (so single clicks/slow drags stay perfectly responsive) and then starts
++	// a short cooldown; any further moves during the cooldown just note that
++	// a repaint is still owed instead of repainting again right away. When
++	// the cooldown timer fires, any owed repaint is flushed and, if the
++	// marker is still moving, a new cooldown begins - capping the repaint
++	// rate to roughly 60Hz regardless of how fast the input events arrive.
++	if (!marker_paint_timer.IsRunning())
++	{
++		RefreshRect(GetMarkerRepaintRect(), false);
++		marker_repaint_pending = false;
++		marker_paint_timer.StartOnce(16);
++	}
++	else
++	{
++		marker_repaint_pending = true;
++	}
++}
++
++void AudioDisplay::OnMarkerPaintTimer(wxTimerEvent &)
++{
++	if (!marker_repaint_pending) return;
++
++	marker_repaint_pending = false;
++	RefreshRect(GetMarkerRepaintRect(), false);
++	marker_paint_timer.StartOnce(16);
+ }
+diff --git a/src/audio_display.h b/src/audio_display.h
+index ad3f42d..4da81e4 100644
+--- a/src/audio_display.h
++++ b/src/audio_display.h
+@@ -96,6 +96,28 @@ class AudioDisplay: public wxWindow {
+ 	/// Timer for scrolling when markers are dragged out of the displayed area
+ 	wxTimer scroll_timer;
+ 
++	/// Timer used to throttle repaints triggered by marker movement to
++	/// roughly the display refresh rate, so that a fast marker drag can't
++	/// queue up repaints (and everything downstream of them) faster than
++	/// they can actually be shown.
++	wxTimer marker_paint_timer;
++	/// Whether a marker moved while marker_paint_timer was already running,
++	/// meaning a repaint is still owed once it fires.
++	bool marker_repaint_pending = false;
++	/// Fires periodically while marker_paint_timer is running to flush any
++	/// pending marker repaint at a bounded rate.
++	void OnMarkerPaintTimer(wxTimerEvent &event);
++	/// The last rectangle invalidated for a marker move, so the next move
++	/// can union with it (ensuring the old marker position gets erased)
++	/// while still avoiding a full-window-width repaint. Empty (width 0)
++	/// means "nothing pending to clear".
++	wxRect marker_dirty_rect;
++	/// Compute a repaint rect tight to the marker's current (mouse) position,
++	/// unioned with wherever it was last painted, and remember it for next
++	/// time. Falls back to the full width if the mouse position can't be
++	/// determined for some reason.
++	wxRect GetMarkerRepaintRect();
++
+ 	wxTimer load_timer;
+ 	int64_t last_sample_decoded = 0;
+ 	/// Time at which audio loading began, for calculating loading speed
