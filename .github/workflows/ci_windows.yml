@@ -1,12 +1,28 @@
-name: Meson CI Windows
+name: Meson CI
 
 on:
   workflow_dispatch:
+    inputs:
+      sccache:
+        description: Use the sccache compilation cache
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
     name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
+    env:
+      # Pull request checkouts use a detached merge commit. Preserve the source
+      # branch in generated non-release version and artifact names.
+      AEGISUB_BUILD_BRANCH: ${{ github.head_ref || github.ref_name }}
+      # Same condition as windows-sign-executable
+      AEGISUB_SIGN_WINDOWS: ${{ matrix.config.os == 'windows-latest' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci/windows-signing') }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: ${{ matrix.config['sccache-key'] }}
 
     strategy:
       fail-fast: false
@@ -14,6 +30,7 @@ jobs:
         config:
           - name: Windows MSVC Release
             os: windows-latest
+            sccache-key: windows-x86_64-msvc
             msvc: true
             devenv: |
               Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
@@ -21,7 +38,7 @@ jobs:
             buildtype: release
             args: >-
               -Ddefault_library=static
-              --force-fallback-for=zlib,harfbuzz,freetype2,fribidi,libpng
+              --force-fallback-for=zlib,harfbuzz,freetype2,fribidi
               -Dfallback_nasm=true
               -Dfreetype2:harfbuzz=disabled
               -Dharfbuzz:freetype=disabled
@@ -35,45 +52,43 @@ jobs:
               -Dlibass:fontconfig=disabled
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: '0'
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
+
+      # Release builds compile from scratch; manual runs can opt out too
+      - name: Set up sccache
+        if: github.ref_type != 'tag' && (github.event_name != 'workflow_dispatch' || inputs.sccache)
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Setup Meson
         run: |
           python -m pip install --upgrade pip setuptools
           pip install meson
 
+      # Taken from https://github.com/libass/libass/blob/0.17.5/.github/workflows/meson.yml#L118-L125
       - name: Find Visual Studio
-        if: matrix.config.msvc
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsPath) { throw "Could not find a Visual Studio installation" }
+          "VS=$vsPath"
           "VS=$vsPath" >> $env:GITHUB_ENV
 
-      - name: Install dependencies
+      - name: Install dependencies (Windows)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           choco install ninja innosetup
 
-          $moonscripturl = "https://github.com/leafo/moonscript/releases/download/v0.6.0/moonscript-v0.6.0-windows-x86_64.zip"
-          mkdir moonscript
-          Invoke-WebRequest -Uri $moonscripturl -OutFile ".\moonscript\moonscript.zip"
-          pushd moonscript
-          7z e moonscript.zip
-          Get-Location | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          popd
-
-          $gettexturl = "https://github.com/mlocati/gettext-iconv-windows/releases/download/v1.0-v1.18-r3/gettext1.0-iconv1.18-static-64.zip"
-          Invoke-WebRequest -Uri $gettexturl -OutFile ".\gettext.zip"
-          Expand-Archive ".\gettext.zip" -DestinationPath gettext
-          pushd gettext/bin
-          Get-Location | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          popd
+          # msgfmt, to compile the translations
+          gh release download --repo mlocati/gettext-iconv-windows --pattern 'gettext*-static-64.zip' --output gettext.zip
+          Expand-Archive gettext.zip -DestinationPath gettext
+          "$PWD\gettext\bin" >> $env:GITHUB_PATH
 
       - name: Configure
         run: |
@@ -85,11 +100,13 @@ jobs:
           ${{ matrix.config.devenv }}
           meson compile -C build
 
+      # --suite limits this to our own tests, excluding those of subproject deps
       - name: Run test
         run: |
           ${{ matrix.config.devenv }}
-          meson test -C build --verbose "gtest main"
+          meson test -C build --verbose --suite Aegisub
 
+      # Windows artifacts
       - name: Generate Windows installer
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,15 +120,98 @@ jobs:
           cd build && ninja win-portable
 
       - name: Upload artifacts - win_installer
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
+        if: env.AEGISUB_SIGN_WINDOWS != 'true'
         with:
           name: ${{ matrix.config.name }} - installer
           path: build/Aegisub-*.exe
           if-no-files-found: error
 
       - name: Upload artifacts - portable.zip
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
+        if: env.AEGISUB_SIGN_WINDOWS != 'true'
         with:
           name: ${{ matrix.config.name }} - portable
-          path: build/aegisub-portable-64.zip
+          path: build/Aegisub-*-portable.zip
           if-no-files-found: error
+
+      # Release builds are signed and packaged by the windows-* jobs below
+      - name: Upload Windows executable for signing
+        uses: actions/upload-artifact@v7
+        if: env.AEGISUB_SIGN_WINDOWS == 'true'
+        with:
+          name: Windows signing - unsigned executable
+          path: build/aegisub.exe
+          if-no-files-found: error
+
+      - name: Upload Windows packaging inputs
+        uses: actions/upload-artifact@v7
+        if: env.AEGISUB_SIGN_WINDOWS == 'true'
+        with:
+          name: Windows signing - packaging inputs
+          path: |
+            build/git_version.h
+            build/po/*/LC_MESSAGES/aegisub.mo
+            build/installer-deps/
+            build/Aegisub-*-portable.zip
+          if-no-files-found: error
+
+  # Signing is kept out of the build job; see sign-windows.yml
+  windows-sign-executable:
+    name: Windows - sign executable
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci/windows-signing'
+    permissions:
+      id-token: write
+    uses: ./.github/workflows/sign-windows.yml
+    with:
+      artifact: Windows signing - unsigned executable
+      signed-artifact: Windows signing - signed executable
+
+  windows-package:
+    name: Windows - package signed executable
+    needs: windows-sign-executable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Inno Setup
+        run: choco install innosetup
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: Windows signing - packaging inputs
+          path: build
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: Windows signing - signed executable
+          path: signed
+
+      - name: Package signed executable
+        run: |
+          Copy-Item signed\aegisub.exe build\aegisub.exe -Force
+          tools\win-installer-setup.ps1 "$PWD\build" "$PWD" x64 -NoBuild
+          packages\win_installer\portable\replace-executable.ps1 (Get-Item build\Aegisub-*-portable.zip) build\aegisub.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Windows signing - unsigned installer
+          path: build/Aegisub-*.exe
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Windows MSVC Release - portable
+          path: build/Aegisub-*-portable.zip
+          if-no-files-found: error
+
+  windows-sign-installer:
+    name: Windows - sign installer
+    needs: windows-package
+    permissions:
+      id-token: write
+    uses: ./.github/workflows/sign-windows.yml
+    with:
+      artifact: Windows signing - unsigned installer
+      signed-artifact: Windows MSVC Release - installer
