@@ -193,26 +193,27 @@ void Project::LoadUnloadFiles(ProjectProperties properties) {
 	auto timecodes = context->path->MakeAbsolute(properties.timecodes_file, "?script");
 	auto keyframes = context->path->MakeAbsolute(properties.keyframes_file, "?script");
 
+	// A linked file that is set but doesn't exist is ignored in every mode
+	// (Always and Ask): it never causes a prompt, a load attempt/error, or an
+	// unload of whatever is currently loaded. An empty path (no linked file)
+	// is left alone so it still unloads the current file, as before.
+	// There are TOCTOU races here but they should not cause any actual harm.
+	if (!audio.empty() && !agi::fs::Exists(audio) && !context->path->IsDummyPath(audio))
+		audio = audio_file;
+
+	if (!video.empty() && !agi::fs::Exists(video) && !context->path->IsDummyPath(video))
+		video = video_file;
+
+	if (!timecodes.empty() && !agi::fs::Exists(timecodes))
+		timecodes = timecodes_file;
+
+	if (!keyframes.empty() && !agi::fs::Exists(keyframes))
+		keyframes = keyframes_file;
+
 	if (video == video_file && audio == audio_file && keyframes == keyframes_file && timecodes == timecodes_file)
 		return;
 
 	if (load_linked == 2) {
-		// There are TOCTOU races here but they should not cause any actual harm.
-		if (!agi::fs::Exists(audio) && !context->path->IsDummyPath(audio))
-			audio = "";
-
-		if (!agi::fs::Exists(video) && !context->path->IsDummyPath(video))
-			video = "";
-
-		if (!agi::fs::Exists(timecodes))
-			timecodes = "";
-
-		if (!agi::fs::Exists(keyframes))
-			keyframes = "";
-
-		if (video == video_file && audio == audio_file && keyframes == keyframes_file && timecodes == timecodes_file)
-			return;
-
 		wxString str = _("Do you want to load/unload the associated files?");
 		str += "\n";
 
