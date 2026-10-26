@@ -27,6 +27,11 @@ namespace agi::lua {
 	/// Install our module loader and add include_path to the module search
 	/// path of the given lua state. Mandatory runtime support is loaded only
 	/// from support_path.
+	///
+	/// If cache_dir is not empty, MoonScript files are compiled through an
+	/// on-disk cache in that directory (which must already exist). Entries are
+	/// only used when the cached source text is byte-identical to the file
+	/// being loaded, so stale entries are harmless.
 	bool Install(lua_State *L, std::vector<agi::fs::path> const& include_path,
-		agi::fs::path const& support_path);
+		agi::fs::path const& support_path, agi::fs::path const& cache_dir = {});
 }

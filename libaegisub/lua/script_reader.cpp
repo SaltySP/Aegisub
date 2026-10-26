@@ -26,6 +26,104 @@
 
 namespace agi::lua {
 	namespace {
+		// Wraps moonscript.loadstring with an on-disk compile cache. Called with
+		// (moonscript module, cache dir, compiler stamp) and returns the
+		// loadstring function to use.
+		const char moonscript_cache_glue[] = R"LUA(
+-- Arguments: moonscript module, cache directory ("" disables caching), compiler stamp
+local moon, cache_dir, stamp = ...
+if cache_dir == "" then return moon.loadstring end
+
+local bit = require("bit")
+local line_tables = require("moonscript.line_tables")
+local to_lua = moon.to_lua
+local lua_load = loadstring or load
+local MAGIC = "AEGICACHE1"
+local TRAILER = "END\n"
+
+local function cache_path(chunkname)
+	local h = 5381
+	for i = 1, #chunkname do
+		h = bit.band(h * 33 + chunkname:byte(i), 0xffffffff)
+	end
+	local base = (chunkname:match("([^/\\]+)$") or "chunk"):gsub("[^%w%._%-]", "_"):sub(-40)
+	return cache_dir .. "/" .. bit.tohex(h) .. "-" .. base .. ".cache"
+end
+
+local function serialize_ltable(lt)
+	local parts, n = {"return {"}, 1
+	for k, v in pairs(lt) do
+		if type(k) ~= "number" or type(v) ~= "number" then return nil end
+		n = n + 1
+		parts[n] = ("[%d]=%d,"):format(k, v)
+	end
+	parts[n + 1] = "}"
+	return table.concat(parts)
+end
+
+-- Returns code, line_table on a valid hit for exactly this source text
+local function read_entry(path, text)
+	local f = io.open(path, "rb")
+	if not f then return nil end
+	local data = f:read("*a")
+	f:close()
+	if not data then return nil end
+
+	local magic, st, a, b, c, body = data:match("^([^\n]*)\n([^\n]*)\n(%d+) (%d+) (%d+)\n()")
+	if magic ~= MAGIC or st ~= stamp then return nil end
+	a, b, c = tonumber(a), tonumber(b), tonumber(c)
+	if #data ~= body - 1 + a + b + c + #TRAILER then return nil end
+	if a ~= #text or data:sub(body, body + a - 1) ~= text then return nil end
+	if data:sub(-#TRAILER) ~= TRAILER then return nil end
+
+	local code = data:sub(body + a, body + a + b - 1)
+	local lt_src = data:sub(body + a + b, body + a + b + c - 1)
+	local fn = lua_load(lt_src, "=moonscript_cache")
+	if not fn then return nil end
+	local lt = fn()
+	if type(lt) ~= "table" then return nil end
+	return code, lt
+end
+
+local function write_entry(path, text, code, lt)
+	local lt_src = serialize_ltable(lt)
+	if not lt_src then return end
+
+	local tmp = ("%s.%s%x.tmp"):format(path, tostring({}):match("0x(%x+)") or "0", math.floor(os.clock() * 1e6))
+	local f = io.open(tmp, "wb")
+	if not f then return end
+	local ok = f:write(MAGIC, "\n", stamp, "\n", #text, " ", #code, " ", #lt_src, "\n",
+		text, code, lt_src, TRAILER)
+	f:close()
+	if not ok then os.remove(tmp) return end
+	if not os.rename(tmp, path) then
+		-- Windows will not rename over an existing file
+		os.remove(path)
+		if not os.rename(tmp, path) then os.remove(tmp) end
+	end
+end
+
+return function(text, chunkname)
+	chunkname = chunkname or "=(moonscript.loadstring)"
+
+	local path = cache_path(chunkname)
+	local ok, code, lt = pcall(read_entry, path, text)
+	if ok and code then
+		local fn = lua_load(code, chunkname)
+		if fn then
+			line_tables[chunkname] = lt
+			return fn
+		end
+	end
+
+	local code, lt_or_err = to_lua(text)
+	if not code then return nil, lt_or_err end
+	line_tables[chunkname] = lt_or_err
+	pcall(write_entry, path, text, code, lt_or_err)
+	return lua_load(code, chunkname)
+end
+)LUA";
+
 		bool load_support_file(lua_State *L, fs::path const& filename) {
 			try {
 				return LoadFile(L, filename);
@@ -132,7 +230,7 @@ namespace agi::lua {
 	}
 
 	bool Install(lua_State *L, std::vector<fs::path> const& include_path,
-		fs::path const& support_path) {
+		fs::path const& support_path, fs::path const& cache_dir) {
 		// set the module load path to include_path
 		lua_getglobal(L, "package");
 		push_value(L, "path");
@@ -185,6 +283,40 @@ namespace agi::lua {
 		if (!lua_isfunction(L, -1)) {
 			lua_pop(L, 2);
 			lua_pushliteral(L, "Bundled moonscript.lua has no loadstring function");
+			return false;
+		}
+		lua_pop(L, 1);
+
+		// The cache is invalidated whenever the bundled compiler changes
+		std::string stamp = "v1";
+		try {
+			auto compiler = support_path / "moonscript.lua";
+			stamp += "-" + std::to_string(agi::fs::Size(compiler));
+			stamp += "-" + std::to_string(agi::fs::ModifiedTime(compiler).time_since_epoch().count());
+		}
+		catch (agi::Exception const&) {
+			// Without a reliable stamp, don't risk serving stale output
+			stamp += "-nostamp";
+		}
+
+		// Build the loadstring function (cached when cache_dir is set)
+		if (luaL_loadbuffer(L, moonscript_cache_glue, sizeof(moonscript_cache_glue) - 1, "=moonscript_cache") != 0) {
+			lua_remove(L, -2); // module, leaving only the error message
+			return false;
+		}
+		lua_pushvalue(L, -2); // moonscript module
+		if (cache_dir.empty())
+			push_value(L, std::string());
+		else
+			push_value(L, cache_dir);
+		push_value(L, stamp);
+		if (lua_pcall(L, 3, 1, 0)) {
+			lua_remove(L, -2); // module, leaving only the error message
+			return false;
+		}
+		if (!lua_isfunction(L, -1)) {
+			lua_pop(L, 2);
+			lua_pushliteral(L, "MoonScript cache setup did not return a loadstring function");
 			return false;
 		}
 		lua_setfield(L, LUA_REGISTRYINDEX, "moonscript");

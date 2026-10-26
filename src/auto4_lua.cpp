@@ -661,7 +661,17 @@ namespace {
 
 		// Replace the default lua module loader with our unicode compatible
 		// one and set the module search path
-		if (!Install(L, include_path, config::path->Decode("?data/automation/include/"))) {
+		// MoonScript compile cache. Failure to create it just disables caching.
+		agi::fs::path moon_cache_dir;
+		try {
+			moon_cache_dir = config::path->Decode("?local/automation-cache");
+			agi::fs::CreateDirectory(moon_cache_dir);
+		}
+		catch (agi::Exception const&) {
+			moon_cache_dir.clear();
+		}
+
+		if (!Install(L, include_path, config::path->Decode("?data/automation/include/"), moon_cache_dir)) {
 			description = get_string_or_default(L, 1);
 			lua_pop(L, 1);
 			return;
