@@ -107,8 +107,14 @@ void AvisynthAudioProvider::LoadFromClip(AVSValue clip) {
 
 	IScriptEnvironment *env = avs_wrapper.GetEnv();
 
-	// Convert to one channel
-	AVSValue script = env->Invoke(OPT_GET("Audio/Downmixer")->GetString().c_str(), clip);
+	// The default downmixer ("ConvertToMono") now means "don't force mono":
+	// stereo is kept as-is and anything with more channels is downmixed to
+	// stereo later in the provider chain. Picking a single channel
+	// (GetLeftChannel/GetRightChannel) still gives a mono stream.
+	AVSValue script = clip;
+	const std::string downmixer = OPT_GET("Audio/Downmixer")->GetString();
+	if (downmixer != "ConvertToMono")
+		script = env->Invoke(downmixer.c_str(), clip);
 
 	// Convert to 16 bits per sample
 	script = env->Invoke("ConvertAudioTo16bit", script);

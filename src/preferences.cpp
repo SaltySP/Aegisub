@@ -455,6 +455,12 @@ void Advanced_Audio(wxTreebook *book, Preferences *parent) {
 	wxArrayString apl_choice = to_wx(AudioPlayerFactory::GetClasses());
 	p->OptionChoice(expert, _("Audio player"), apl_choice, "Audio/Player");
 
+	// Surround audio is always downmixed to the selected format. The waveform and
+	// spectrum are always drawn from a single (averaged) channel.
+	const wxString oc_arr[2] = { _("Stereo"), _("Mono") };
+	wxArrayString oc_choice(2, oc_arr);
+	p->OptionChoice(expert, _("Output channels"), oc_choice, "Audio/Output Channels");
+
 	auto cache = p->PageSizer(_("Cache"));
 	const wxString ct_arr[3] = { _("None (NOT RECOMMENDED)"), _("RAM"), _("Hard Disk") };
 	wxArrayString ct_choice(3, ct_arr);

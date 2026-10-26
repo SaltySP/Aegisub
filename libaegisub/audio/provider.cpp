@@ -35,9 +35,32 @@ void AudioProvider::GetAudioWithVolume(void *buf, int64_t start, int64_t count, 
 	if (bytes_per_sample != 2)
 		throw agi::InternalError("GetAudioWithVolume called on unconverted audio stream");
 
+	// The buffer holds count frames of interleaved samples
 	auto buffer = static_cast<int16_t *>(buf);
-	for (size_t i = 0; i < (size_t)count; ++i)
+	for (size_t i = 0; i < (size_t)count * channels; ++i)
 		buffer[i] = util::mid(-0x8000, static_cast<int>(buffer[i] * volume + 0.5), 0x7FFF);
+}
+
+void AudioProvider::GetAudioMono16(int16_t *buf, int64_t start, int64_t count) const {
+	if (bytes_per_sample != 2 || float_samples)
+		throw agi::InternalError("GetAudioMono16 called on unconverted audio stream");
+
+	if (channels == 1) {
+		GetAudio(buf, start, count);
+		return;
+	}
+
+	// Renderers may call this from different threads
+	thread_local std::vector<int16_t> interleaved;
+	interleaved.resize(static_cast<size_t>(count) * channels);
+	GetAudio(interleaved.data(), start, count);
+
+	for (int64_t i = 0; i < count; ++i) {
+		int sum = 0;
+		for (int c = 0; c < channels; ++c)
+			sum += interleaved[i * channels + c];
+		buf[i] = static_cast<int16_t>(sum / channels);
+	}
 }
 
 void AudioProvider::ZeroFill(void *buf, int64_t count) const {

@@ -122,9 +122,11 @@ std::unique_ptr<agi::AudioProvider> GetAudioProvider(fs::path const& filename,
 
 	bool needs_cache = provider->NeedsCache();
 
-	// Give it a converter if needed
-	if (provider->GetBytesPerSample() != 2 || provider->GetSampleRate() < 32000 || provider->GetChannels() != 1)
-		provider = CreateConvertAudioProvider(std::move(provider));
+	// Give it a converter if needed. The output format preference is
+	// 0 = stereo (the default), 1 = mono.
+	const int max_channels = OPT_GET("Audio/Output Channels")->GetInt() == 1 ? 1 : 2;
+	if (provider->GetBytesPerSample() != 2 || provider->GetSampleRate() < 32000 || provider->GetChannels() > max_channels)
+		provider = CreateConvertAudioProvider(std::move(provider), max_channels);
 
 	// Change provider to RAM/HD cache if needed
 	auto cache = OPT_GET("Audio/Cache/Type")->GetInt();

@@ -286,33 +286,142 @@ TEST(lagi_audio, sample_doubling) {
 	}
 }
 
-TEST(lagi_audio, stereo_downmix) {
-	struct AudioProvider : agi::AudioProvider {
-		AudioProvider() {
-			channels = 2;
-			num_samples = 90 * 480000;
-			decoded_samples = num_samples;
-			sample_rate = 480000;
-			bytes_per_sample = 2;
-			float_samples = false;
-		}
+namespace {
+/// Provider with a constant value per channel (or a ramp on channel 0 if ramp is set)
+struct MultiChannelProvider : agi::AudioProvider {
+	std::vector<int16_t> values;
+	bool ramp = false;
 
-		void FillBuffer(void *buf, int64_t start, int64_t count) const override {
-			auto out = static_cast<int16_t *>(buf);
-			for (int64_t end = start + count; start < end; ++start) {
-				*out++ = (int16_t)(start * 2);
-				*out++ = 0;
-			}
-		}
-	};
+	MultiChannelProvider(std::vector<int16_t> values, int rate = 48000, bool ramp = false)
+	: values(std::move(values)), ramp(ramp) {
+		channels = this->values.size();
+		num_samples = 90 * rate;
+		decoded_samples = num_samples;
+		sample_rate = rate;
+		bytes_per_sample = 2;
+		float_samples = false;
+	}
 
-	auto provider = agi::CreateConvertAudioProvider(std::make_unique<AudioProvider>());
+	void FillBuffer(void *buf, int64_t start, int64_t count) const override {
+		auto out = static_cast<int16_t *>(buf);
+		for (int64_t end = start + count; start < end; ++start) {
+			for (int c = 0; c < channels; ++c)
+				*out++ = (ramp && c == 0) ? (int16_t)(start * 2) : values[c];
+		}
+	}
+};
+}
+
+TEST(lagi_audio, stereo_is_not_downmixed_by_default) {
+	auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(std::vector<int16_t>{1000, -2000}));
+	EXPECT_EQ(2, provider->GetChannels());
+
+	int16_t samples[8];
+	provider->GetAudio(samples, 0, 4);
+	for (int i = 0; i < 4; ++i) {
+		EXPECT_EQ(1000, samples[i * 2]);
+		EXPECT_EQ(-2000, samples[i * 2 + 1]);
+	}
+}
+
+TEST(lagi_audio, stereo_to_mono_averages_channels) {
+	// Left is a ramp, right is silent, so mono is half the left channel
+	auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(std::vector<int16_t>{0, 0}, 480000, true), 1);
 	EXPECT_EQ(1, provider->GetChannels());
 
 	int16_t samples[100];
 	provider->GetAudio(samples, 0, 100);
 	for (int i = 0; i < 100; ++i)
 		EXPECT_EQ(i, samples[i]);
+}
+
+TEST(lagi_audio, mono_is_left_alone_in_both_modes) {
+	for (int max_channels : {1, 2}) {
+		auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(std::vector<int16_t>{1234}), max_channels);
+		EXPECT_EQ(1, provider->GetChannels());
+		int16_t sample;
+		provider->GetAudio(&sample, 5, 1);
+		EXPECT_EQ(1234, sample);
+	}
+}
+
+TEST(lagi_audio, surround_downmixes_to_stereo) {
+	// Channel order is FL FR FC LFE BL BR. These values are the ones libswresample
+	// produces for each channel on its own at 10000.
+	struct { int channel; int left; int right; } cases[] = {
+		{0, 4142, 0}, {1, 0, 4142}, {2, 2929, 2929}, {3, 0, 0}, {4, 2929, 0}, {5, 0, 2929},
+	};
+	for (auto const& c : cases) {
+		SCOPED_TRACE(c.channel);
+		std::vector<int16_t> values(6, 0);
+		values[c.channel] = 10000;
+		auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(values));
+		ASSERT_EQ(2, provider->GetChannels());
+
+		int16_t samples[2];
+		provider->GetAudio(samples, 10, 1);
+		EXPECT_NEAR(c.left, samples[0], 1);
+		EXPECT_NEAR(c.right, samples[1], 1);
+	}
+}
+
+TEST(lagi_audio, surround_downmix_does_not_clip) {
+	auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(std::vector<int16_t>(6, SHRT_MAX)));
+	int16_t samples[2];
+	provider->GetAudio(samples, 0, 1);
+	EXPECT_EQ(SHRT_MAX, samples[0]);
+	EXPECT_EQ(SHRT_MAX, samples[1]);
+}
+
+TEST(lagi_audio, surround_downmixes_to_mono) {
+	// Front-left only: mono is half of the stereo downmix
+	std::vector<int16_t> values(6, 0);
+	values[0] = 10000;
+	auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(values), 1);
+	ASSERT_EQ(1, provider->GetChannels());
+
+	int16_t sample;
+	provider->GetAudio(&sample, 0, 1);
+	EXPECT_NEAR(2071, sample, 1);
+}
+
+TEST(lagi_audio, sample_doubling_stereo) {
+	auto provider = agi::CreateConvertAudioProvider(std::make_unique<MultiChannelProvider>(std::vector<int16_t>{0, 500}, 20000, true));
+	ASSERT_EQ(2, provider->GetChannels());
+	EXPECT_EQ(40000, provider->GetSampleRate());
+
+	// Left is the ramp from the sample doubling test, right is constant
+	int16_t samples[12];
+	for (int k = 0; k < 6; ++k) {
+		SCOPED_TRACE(k);
+		for (int i = k + 1; i <= 6; ++i) {
+			SCOPED_TRACE(i);
+			memset(samples, 0, sizeof(samples));
+			provider->GetAudio(samples, k, i - k);
+			for (int j = 0; j < i - k; ++j) {
+				EXPECT_EQ(j + k, samples[j * 2]);
+				EXPECT_EQ(500, samples[j * 2 + 1]);
+			}
+		}
+	}
+}
+
+TEST(lagi_audio, volume_applies_to_every_channel) {
+	MultiChannelProvider provider(std::vector<int16_t>{1000, 3000});
+	int16_t samples[8];
+	provider.GetAudioWithVolume(samples, 0, 4, 0.5);
+	for (int i = 0; i < 4; ++i) {
+		EXPECT_EQ(500, samples[i * 2]);
+		EXPECT_EQ(1500, samples[i * 2 + 1]);
+	}
+}
+
+TEST(lagi_audio, mono16_helper_averages_channels) {
+	MultiChannelProvider provider(std::vector<int16_t>{1000, 3000});
+	int16_t samples[4];
+	provider.GetAudioMono16(samples, 0, 4);
+	for (int i = 0; i < 4; ++i)
+		EXPECT_EQ(2000, samples[i]);
 }
 
 template<typename Float>

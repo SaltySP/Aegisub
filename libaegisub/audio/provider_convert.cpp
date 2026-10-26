@@ -19,10 +19,14 @@
 #include <libaegisub/endian.h>
 #include <libaegisub/log.h>
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <ranges>
 #include <span>
+#include <vector>
 
 using namespace agi;
 
@@ -114,15 +118,78 @@ public:
 	}
 };
 
-/// Non-mono 16-bit signed machine-endian -> mono 16-bit signed machine endian converter
+/// Multichannel 16-bit signed machine-endian -> stereo (or mono) 16-bit signed
+/// machine endian converter
+///
+/// Layouts are assumed to follow the usual WAVE / FFmpeg channel order:
+///   3: FL FR FC                       4: FL FR BL BR
+///   5: FL FR FC BL BR                 6: FL FR FC LFE BL BR  (5.1)
+///   7: FL FR FC LFE BC SL SR  (6.1)   8: FL FR FC LFE BL BR SL SR  (7.1)
+/// Anything else is averaged into both output channels. For mono output the
+/// stereo mix is averaged down to one channel.
+///
+/// The coefficients are the same ones libswresample uses for its default
+/// downmix (center and surround at -3dB, LFE dropped), normalized so that the
+/// loudest output channel can't clip, so the result is consistent with what the
+/// FFmpegSource provider produces.
 class DownmixAudioProvider final : public AudioProviderWrapper {
 	int src_channels;
+	std::vector<float> matrix; ///< One row of src_channels coefficients per output channel
 	mutable std::vector<int16_t> src_buf;
 
+	void BuildMatrix() {
+		constexpr float mix = 0.70710678f; // -3dB
+		constexpr float back_center = 0.5f; // -6dB
+		matrix.assign(2 * src_channels, 0.f);
+		auto set = [&](int ch, float left, float right) {
+			matrix[ch] = left;
+			matrix[src_channels + ch] = right;
+		};
+
+		switch (src_channels) {
+		case 3: set(0, 1, 0); set(1, 0, 1); set(2, mix, mix); break;
+		case 4: set(0, 1, 0); set(1, 0, 1); set(2, mix, 0); set(3, 0, mix); break;
+		case 5: set(0, 1, 0); set(1, 0, 1); set(2, mix, mix); set(3, mix, 0); set(4, 0, mix); break;
+		case 6: set(0, 1, 0); set(1, 0, 1); set(2, mix, mix); set(4, mix, 0); set(5, 0, mix); break;
+		case 7:
+			set(0, 1, 0); set(1, 0, 1); set(2, mix, mix);
+			set(4, back_center, back_center); set(5, mix, 0); set(6, 0, mix);
+			break;
+		case 8:
+			set(0, 1, 0); set(1, 0, 1); set(2, mix, mix);
+			set(4, mix, 0); set(5, 0, mix); set(6, mix, 0); set(7, 0, mix);
+			break;
+		default:
+			for (int c = 0; c < src_channels; ++c)
+				set(c, 1.f, 1.f);
+			break;
+		}
+
+		// Normalize so the largest possible output is full scale
+		float max_sum = 0.f;
+		for (int row = 0; row < 2; ++row) {
+			float sum = 0.f;
+			for (int c = 0; c < src_channels; ++c)
+				sum += std::abs(matrix[row * src_channels + c]);
+			max_sum = std::max(max_sum, sum);
+		}
+		if (max_sum > 1.f)
+			for (auto& coef : matrix)
+				coef /= max_sum;
+
+		// Fold the stereo mix down to a single channel
+		if (channels == 1) {
+			for (int c = 0; c < src_channels; ++c)
+				matrix[c] = (matrix[c] + matrix[src_channels + c]) * 0.5f;
+			matrix.resize(src_channels);
+		}
+	}
+
 public:
-	DownmixAudioProvider(std::unique_ptr<AudioProvider> src) : AudioProviderWrapper(std::move(src)) {
+	DownmixAudioProvider(std::unique_ptr<AudioProvider> src, int out_channels) : AudioProviderWrapper(std::move(src)) {
 		src_channels = channels;
-		channels = 1;
+		channels = out_channels;
+		BuildMatrix();
 	}
 
 	void FillBuffer(void *buf, int64_t start, int64_t count) const override {
@@ -130,18 +197,21 @@ public:
 		source->GetAudio(&src_buf[0], start, count);
 
 		auto dst = static_cast<int16_t*>(buf);
-		// Just average the channels together
-		while (count-- > 0) {
-			int sum = 0;
-			for (int c = 0; c < src_channels; ++c)
-				sum += src_buf[count * src_channels + c];
-			dst[count] = static_cast<int16_t>(sum / src_channels);
+		for (int64_t i = 0; i < count; ++i) {
+			const int16_t *in = &src_buf[i * src_channels];
+			for (int row = 0; row < channels; ++row) {
+				const float *coefs = &matrix[row * src_channels];
+				float sum = 0.f;
+				for (int c = 0; c < src_channels; ++c)
+					sum += in[c] * coefs[c];
+				dst[i * channels + row] = static_cast<int16_t>(std::clamp(std::lround(sum), -32768L, 32767L));
+			}
 		}
 	}
 };
 
 /// Sample doubler with linear interpolation for the samples provider
-/// Requires 16-bit mono input
+/// Requires 16-bit input (any number of interleaved channels)
 class SampleDoublingAudioProvider final : public AudioProviderWrapper {
 public:
 	SampleDoublingAudioProvider(std::unique_ptr<AudioProvider> src) : AudioProviderWrapper(std::move(src)) {
@@ -151,13 +221,15 @@ public:
 	}
 
 	void FillBuffer(void *buf, int64_t start, int64_t count) const override {
+		const int ch = channels;
 		int16_t *src, *dst = static_cast<int16_t *>(buf);
 
-		// We need to always get at least two samples to be able to interpolate
-		int16_t srcbuf[2];
+		// We need to always get at least two frames to be able to interpolate
+		std::vector<int16_t> srcbuf;
 		if (count == 1) {
-			source->GetAudio(srcbuf, start / 2, 2);
-			src = srcbuf;
+			srcbuf.resize(2 * ch);
+			source->GetAudio(srcbuf.data(), start / 2, 2);
+			src = srcbuf.data();
 		}
 		else {
 			source->GetAudio(buf, start / 2, (start + count) / 2 - start / 2 + 1);
@@ -168,17 +240,23 @@ public:
 		for (; count > 0; --count) {
 			auto src_index = (start + count - 1) / 2 - start / 2;
 			auto i = count - 1;
-			if ((start + i) & 1)
-				dst[i] = (int16_t)(((int32_t)src[src_index] + src[src_index + 1]) / 2);
-			else
-				dst[i] = src[src_index];
+			if ((start + i) & 1) {
+				for (int c = 0; c < ch; ++c)
+					dst[i * ch + c] = (int16_t)(((int32_t)src[src_index * ch + c] + src[(src_index + 1) * ch + c]) / 2);
+			}
+			else {
+				for (int c = 0; c < ch; ++c)
+					dst[i * ch + c] = src[src_index * ch + c];
+			}
 		}
 	}
 };
 }
 
 namespace agi {
-std::unique_ptr<AudioProvider> CreateConvertAudioProvider(std::unique_ptr<AudioProvider> provider) {
+std::unique_ptr<AudioProvider> CreateConvertAudioProvider(std::unique_ptr<AudioProvider> provider, int max_channels) {
+	max_channels = max_channels == 1 ? 1 : 2;
+
 	// Ensure 16-bit audio with proper endianness
 	if (provider->AreSamplesFloat()) {
 		LOG_D("audio_provider") << "Converting float to S16";
@@ -192,10 +270,10 @@ std::unique_ptr<AudioProvider> CreateConvertAudioProvider(std::unique_ptr<AudioP
 		provider = std::make_unique<BitdepthConvertAudioProvider<int16_t>>(std::move(provider));
 	}
 
-	// We currently only support mono audio
-	if (provider->GetChannels() != 1) {
-		LOG_D("audio_provider") << "Downmixing to mono from " << provider->GetChannels() << " channels";
-		provider = std::make_unique<DownmixAudioProvider>(std::move(provider));
+	// Anything with more channels than requested is downmixed
+	if (provider->GetChannels() > max_channels) {
+		LOG_D("audio_provider") << "Downmixing to " << max_channels << " channel(s) from " << provider->GetChannels() << " channels";
+		provider = std::make_unique<DownmixAudioProvider>(std::move(provider), max_channels);
 	}
 
 	// Some players don't like low sample rate audio

@@ -53,6 +53,7 @@
 
 Project::Project(agi::Context *c) : context(c) {
 	BindConnection(OPT_SUB("Audio/Cache/Type", &Project::ReloadAudio, this));
+	BindConnection(OPT_SUB("Audio/Output Channels", &Project::ReloadAudio, this));
 	BindConnection(OPT_SUB("Audio/Provider", &Project::ReloadAudio, this));
 	BindConnection(OPT_SUB("Provider/Audio/FFmpegSource/Decode Error Handling", &Project::ReloadAudio, this));
 	BindConnection(OPT_SUB("Provider/Avisynth/Allow Ancient", &Project::ReloadVideo, this));

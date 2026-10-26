@@ -164,15 +164,21 @@ void FFmpegSourceAudioProvider::LoadAudio(agi::fs::path const& filename) {
 			throw agi::AudioProviderError("unknown or unsupported sample format");
 	}
 
-	if (channels > 1 || bytes_per_sample != 2) {
+	// Mono and stereo sources keep their channels; anything with more channels
+	// (5.1, 7.1, ...) is downmixed to stereo by FFMS2's resampler. Sources that
+	// aren't 16-bit are converted to 16-bit here as well.
+	if (channels > 2 || bytes_per_sample != 2) {
+		const int out_channels = channels == 1 ? 1 : 2;
+
 		std::unique_ptr<FFMS_ResampleOptions, decltype(&FFMS_DestroyResampleOptions)>
 			opt(FFMS_CreateResampleOptions(AudioSource), FFMS_DestroyResampleOptions);
-		opt->ChannelLayout = FFMS_CH_FRONT_CENTER;
+		opt->ChannelLayout = out_channels == 1 ? FFMS_CH_FRONT_CENTER
+		                                       : (FFMS_CH_FRONT_LEFT | FFMS_CH_FRONT_RIGHT);
 		opt->SampleFormat = FFMS_FMT_S16;
 
 		// Might fail if FFMS2 wasn't built with libavresample
 		if (!FFMS_SetOutputFormatA(AudioSource, opt.get(), nullptr)) {
-			channels = 1;
+			channels = out_channels;
 			bytes_per_sample = 2;
 			float_samples = false;
 		}

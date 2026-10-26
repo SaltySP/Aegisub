@@ -33,23 +33,27 @@ class HDAudioProvider final : public AudioProviderWrapper {
 	std::atomic<bool> cancelled = {false};
 	std::thread decoder;
 
+	/// Bytes in one frame (one sample for every channel)
+	int64_t BytesPerFrame() const { return static_cast<int64_t>(bytes_per_sample) * channels; }
+
 	void FillBuffer(void *buf, int64_t start, int64_t count) const override {
+		const int64_t frame_bytes = BytesPerFrame();
 		auto missing = std::min(count, start + count - decoded_samples);
 		if (missing > 0) {
-			memset(static_cast<int16_t*>(buf) + count - missing, 0, missing * bytes_per_sample);
+			memset(static_cast<char *>(buf) + (count - missing) * frame_bytes, 0, missing * frame_bytes);
 			count -= missing;
 		}
 
 		if (count > 0) {
-			start *= bytes_per_sample;
-			count *= bytes_per_sample;
+			start *= frame_bytes;
+			count *= frame_bytes;
 			memcpy(buf, file.read(start, count), count);
 		}
 	}
 
   fs::path CacheFilename(fs::path const& dir) {
 		// Check free space
-		if ((uint64_t)num_samples * bytes_per_sample > fs::FreeSpace(dir))
+		if ((uint64_t)num_samples * bytes_per_sample * channels > fs::FreeSpace(dir))
 			throw AudioProviderError("Not enough free disk space in " + dir.string() + " to cache the audio");
 
 		return format("audio-%lld-%lld", time(nullptr),
@@ -59,7 +63,7 @@ class HDAudioProvider final : public AudioProviderWrapper {
 public:
 	HDAudioProvider(std::unique_ptr<AudioProvider> src, fs::path const& dir)
 	: AudioProviderWrapper(std::move(src))
-	, file(dir / CacheFilename(dir), num_samples * bytes_per_sample)
+	, file(dir / CacheFilename(dir), num_samples * bytes_per_sample * channels)
 	{
 		decoded_samples = 0;
 		decoder = std::thread([&] {
@@ -67,7 +71,8 @@ public:
 			for (int64_t i = 0; i < num_samples; i += block) {
 				if (cancelled) break;
 				block = std::min(block, num_samples - i);
-				source->GetAudio(file.write(i * bytes_per_sample, block * bytes_per_sample), i, block);
+				const int64_t frame_bytes = BytesPerFrame();
+				source->GetAudio(file.write(i * frame_bytes, block * frame_bytes), i, block);
 				decoded_samples += block;
 			}
 		});
